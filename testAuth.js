@@ -1,6 +1,7 @@
 const axios = require('axios');
+import 'dotenv/config';
 
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = process.env.BASE_URL || 'http://68.183.81.247:5000/api';
 
 // Test authentication and role-based access
 async function testAuth() {

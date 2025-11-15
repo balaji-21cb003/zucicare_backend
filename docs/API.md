@@ -2,7 +2,7 @@
 
 ## Base URL
 ```
-http://localhost:5000/api
+http://68.183.81.247:5000/api
 ```
 
 ## Authentication
