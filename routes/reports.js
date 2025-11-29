@@ -10,21 +10,19 @@ const { auth, authorize } = require('../middleware/auth');
 router.get('/revenue_and_income', auth, authorize('superadmin', 'admin'), async (req, res) => {
   try {
     const { startDate, endDate, washType, area, customerType } = req.query;
+    
+    console.log('Revenue API called with filters:', { startDate, endDate, washType, area, customerType });
+    
     const matchConditions = { status: 'Converted' };
 
-    if (startDate && endDate) {
-      const start = new Date(startDate);
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      
-      matchConditions.createdAt = {
-        $gte: start,
-        $lte: end
-      };
+    // Apply customer type filter at lead level
+    if (customerType && customerType !== '' && customerType !== 'All Types') {
+      matchConditions.leadType = customerType;
     }
 
-    if (customerType && customerType !== 'All Types') {
-      matchConditions.leadType = customerType;
+    // Apply area filter at lead level
+    if (area && area !== '' && area !== 'All') {
+      matchConditions.area = area;
     }
 
     const leads = await Lead.find(matchConditions)
@@ -41,19 +39,25 @@ router.get('/revenue_and_income', auth, authorize('superadmin', 'admin'), async 
 
     let totalRevenue = 0;
     let totalWashes = 0;
-    let totalCustomers = leads.length;
     let revenueByWashType = {};
     let washesByType = {};
     let revenueByCustomerType = {};
     let customersByType = {};
     let recentTransactions = [];
     let paymentSummary = { total: 0, paid: 0, unpaid: 0 };
+    let uniqueCustomers = new Set();
 
-    // Count customers by type
-    leads.forEach(lead => {
-      const type = lead.leadType || 'Unknown';
-      customersByType[type] = (customersByType[type] || 0) + 1;
-    });
+    // Parse date filters
+    let startDateObj = null;
+    let endDateObj = null;
+    if (startDate) {
+      startDateObj = new Date(startDate);
+      startDateObj.setHours(0, 0, 0, 0);
+    }
+    if (endDate) {
+      endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+    }
 
     // Process wash history
     leads.forEach(lead => {
@@ -61,14 +65,27 @@ router.get('/revenue_and_income', auth, authorize('superadmin', 'admin'), async 
         lead.washHistory.forEach(wash => {
           if (wash.washStatus === 'completed') {
             const amount = parseFloat(wash.amount) || 0;
-            const washTypeFilter = washType && washType !== 'All Types' ? wash.washType === washType : true;
-            const areaFilter = area ? lead.area === area : true;
-            const dateFilter = startDate && endDate ? 
-              new Date(wash.date) >= new Date(startDate) && new Date(wash.date) <= new Date(endDate) : true;
             
-            if (washTypeFilter && areaFilter && dateFilter) {
+            // Apply date filter
+            let dateMatch = true;
+            if (startDateObj && endDateObj && wash.date) {
+              const washDate = new Date(wash.date);
+              dateMatch = washDate >= startDateObj && washDate <= endDateObj;
+            }
+            
+            // Apply wash type filter
+            let washTypeMatch = true;
+            if (washType && washType !== '' && washType !== 'All Types') {
+              washTypeMatch = wash.washType === washType;
+            }
+            
+            // Only include if all filters match
+            if (dateMatch && washTypeMatch) {
               totalRevenue += amount;
               totalWashes++;
+              
+              // Track unique customers
+              uniqueCustomers.add(lead._id.toString());
               
               // Revenue by wash type
               if (wash.washType) {
@@ -77,8 +94,8 @@ router.get('/revenue_and_income', auth, authorize('superadmin', 'admin'), async 
               }
               
               // Revenue by customer type
-              const customerType = lead.leadType || 'Unknown';
-              revenueByCustomerType[customerType] = (revenueByCustomerType[customerType] || 0) + amount;
+              const custType = lead.leadType || 'Unknown';
+              revenueByCustomerType[custType] = (revenueByCustomerType[custType] || 0) + amount;
               
               // Payment summary
               paymentSummary.total += amount;
@@ -111,24 +128,36 @@ router.get('/revenue_and_income', auth, authorize('superadmin', 'admin'), async 
         lead.monthlySubscription.scheduledWashes.forEach(wash => {
           if (wash.status === 'completed') {
             const amount = parseFloat(wash.amount) || 0;
-            const washTypeFilter = washType && washType !== 'All Types' ? lead.monthlySubscription.packageType === washType : true;
-            const areaFilter = area ? lead.area === area : true;
-            const dateFilter = startDate && endDate ? 
-              new Date(wash.completedDate || wash.scheduledDate) >= new Date(startDate) && 
-              new Date(wash.completedDate || wash.scheduledDate) <= new Date(endDate) : true;
+            const packageType = lead.monthlySubscription.packageType || 'Standard';
             
-            if (washTypeFilter && areaFilter && dateFilter) {
+            // Apply date filter
+            let dateMatch = true;
+            if (startDateObj && endDateObj) {
+              const washDate = new Date(wash.completedDate || wash.scheduledDate);
+              dateMatch = washDate >= startDateObj && washDate <= endDateObj;
+            }
+            
+            // Apply wash type filter
+            let washTypeMatch = true;
+            if (washType && washType !== '' && washType !== 'All Types') {
+              washTypeMatch = packageType === washType;
+            }
+            
+            // Only include if all filters match
+            if (dateMatch && washTypeMatch) {
               totalRevenue += amount;
               totalWashes++;
               
+              // Track unique customers
+              uniqueCustomers.add(lead._id.toString());
+              
               // Revenue by wash type
-              const packageType = lead.monthlySubscription.packageType || 'Standard';
               revenueByWashType[packageType] = (revenueByWashType[packageType] || 0) + amount;
               washesByType[packageType] = (washesByType[packageType] || 0) + 1;
               
               // Revenue by customer type
-              const customerType = lead.leadType || 'Unknown';
-              revenueByCustomerType[customerType] = (revenueByCustomerType[customerType] || 0) + amount;
+              const custType = lead.leadType || 'Unknown';
+              revenueByCustomerType[custType] = (revenueByCustomerType[custType] || 0) + amount;
               
               // Payment summary
               paymentSummary.total += amount;
@@ -157,6 +186,17 @@ router.get('/revenue_and_income', auth, authorize('superadmin', 'admin'), async 
       }
     });
 
+    // Calculate customer counts based on unique customers in filtered transactions
+    uniqueCustomers.forEach(customerId => {
+      const lead = leads.find(l => l._id.toString() === customerId);
+      if (lead) {
+        const type = lead.leadType || 'Unknown';
+        customersByType[type] = (customersByType[type] || 0) + 1;
+      }
+    });
+
+    const totalCustomers = uniqueCustomers.size;
+
     // Get expenses for the same period
     let expenseMatchConditions = {};
     if (startDate && endDate) {
@@ -172,6 +212,14 @@ router.get('/revenue_and_income', auth, authorize('superadmin', 'admin'), async 
 
     // Sort transactions by date (newest first)
     recentTransactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    console.log('Revenue API response:', {
+      totalRevenue,
+      totalWashes,
+      totalCustomers,
+      transactionCount: recentTransactions.length,
+      filters: { startDate, endDate, washType, area, customerType }
+    });
 
     res.json({
       totalRevenue: totalRevenue || 0,
