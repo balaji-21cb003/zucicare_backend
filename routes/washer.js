@@ -583,16 +583,40 @@ router.get('/:id/attendance', async (req, res) => {
       });
     }
 
-    // Calculate statistics
+    // Calculate statistics with hours and minutes
+    let totalMinutes = 0;
+    attendance.forEach(a => {
+      if (a.duration) {
+        totalMinutes += (a.duration * 60); // Convert hours to minutes
+      }
+    });
+    
+    const totalHours = Math.floor(totalMinutes / 60);
+    const remainingMinutes = Math.round(totalMinutes % 60);
+
     const stats = {
       totalDays: attendance.length,
       presentDays: attendance.filter(a => a.timeIn && a.timeOut).length,
       incompleteDays: attendance.filter(a => a.timeIn && !a.timeOut).length,
-      totalHours: attendance.reduce((sum, a) => sum + (a.duration || 0), 0)
+      totalHours: totalHours,
+      totalMinutes: remainingMinutes,
+      totalHoursDecimal: attendance.reduce((sum, a) => sum + (a.duration || 0), 0) // Keep decimal for backward compatibility
     };
 
+    // Add formatted duration to each attendance record
+    const formattedAttendance = attendance.map(a => {
+      const durationMinutes = (a.duration || 0) * 60;
+      const hours = Math.floor(durationMinutes / 60);
+      const minutes = Math.round(durationMinutes % 60);
+      
+      return {
+        ...a.toObject(),
+        durationFormatted: `${hours} hrs ${minutes} mins`
+      };
+    });
+
     res.json({
-      attendance: attendance.sort((a, b) => new Date(b.date) - new Date(a.date)),
+      attendance: formattedAttendance.sort((a, b) => new Date(b.date) - new Date(a.date)),
       stats
     });
   } catch (error) {

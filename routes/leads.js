@@ -852,6 +852,54 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// Update customer location
+router.put('/:id/location', auth, async (req, res) => {
+  try {
+    const { latitude, longitude } = req.body;
+
+    if (!latitude || !longitude) {
+      return res.status(400).json({ message: 'Latitude and longitude are required' });
+    }
+
+    let lead;
+    // Try numeric ID first
+    if (!isNaN(req.params.id)) {
+      lead = await Lead.findOneAndUpdate(
+        { id: parseInt(req.params.id) },
+        {
+          location: {
+            type: 'Point',
+            coordinates: [parseFloat(longitude), parseFloat(latitude)]
+          }
+        },
+        { new: true }
+      );
+    }
+
+    // If not found by numeric ID and ID looks like ObjectId, try MongoDB ID
+    if (!lead && req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
+      lead = await Lead.findByIdAndUpdate(
+        req.params.id,
+        {
+          location: {
+            type: 'Point',
+            coordinates: [parseFloat(longitude), parseFloat(latitude)]
+          }
+        },
+        { new: true }
+      );
+    }
+
+    if (!lead) {
+      return res.status(404).json({ message: 'Lead not found' });
+    }
+
+    res.json({ message: 'Location updated successfully', location: lead.location });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
+
 // Delete lead
 router.delete('/:id', auth, authorize('admin', 'superadmin'), async (req, res) => {
   try {
@@ -1444,7 +1492,7 @@ router.post('/:id/test-subscription', async (req, res) => {
 router.post('/:id/monthly-subscription', async (req, res) => {
   try {
     const leadId = parseInt(req.params.id);
-    const { packageType, scheduledDates, customWashes, customAmount, paymentStatus, customPlanName, totalInteriorWashes, washerId } = req.body;
+    const { packageType, scheduledDates, customWashes, customAmount, paymentStatus, customPlanName, totalInteriorWashes, washerId, washDetails } = req.body;
     
     const lead = await Lead.findOne({ id: leadId });
     if (!lead) {
@@ -1455,7 +1503,7 @@ router.post('/:id/monthly-subscription', async (req, res) => {
       return res.status(400).json({ message: 'Package type and scheduled dates are required' });
     }
 
-    // Find washer if provided
+    // Find washer if provided (for backward compatibility)
     let washer = null;
     if (washerId) {
       if (!isNaN(washerId)) {
@@ -1489,7 +1537,7 @@ router.post('/:id/monthly-subscription', async (req, res) => {
     
     // Create scheduled washes with equal amount distribution
     const amountPerWash = Math.round(price / washes);
-    const scheduledWashes = scheduledDates.map((date, index) => {
+    const scheduledWashes = await Promise.all(scheduledDates.map(async (date, index) => {
       const washDate = new Date(date);
       const isToday = washDate.toDateString() === today.toDateString();
       const isTomorrow = washDate.toDateString() === tomorrow.toDateString();
@@ -1497,17 +1545,36 @@ router.post('/:id/monthly-subscription', async (req, res) => {
       if (isToday || isTomorrow) {
         hasAutoAssignmentDate = true;
       }
+
+      // Get wash details for this specific wash
+      const washDetail = washDetails && washDetails[index] ? washDetails[index] : {};
+      const serviceType = washDetail.serviceType || 'Exterior';
+      const scheduledTime = washDetail.time || '10:00';
+      
+      // Find washer for this specific wash
+      let washWasher = null;
+      if (washDetail.washerId) {
+        if (!isNaN(washDetail.washerId)) {
+          washWasher = await User.findOne({ id: parseInt(washDetail.washerId) });
+        } else if (washDetail.washerId.match(/^[0-9a-fA-F]{24}$/)) {
+          washWasher = await User.findById(washDetail.washerId);
+        }
+      } else if ((isToday || isTomorrow) && washer) {
+        // Fallback to global washer for backward compatibility
+        washWasher = washer;
+      }
       
       return {
         washNumber: index + 1,
         scheduledDate: washDate,
+        scheduledTime: scheduledTime,
         status: 'scheduled',
         amount: amountPerWash,
         is_amountPaid: Boolean(paymentStatus),
-        washServiceType: 'Exterior',
-        washer: (isToday || isTomorrow) && washer ? washer._id : null
+        washServiceType: serviceType,
+        washer: washWasher ? washWasher._id : null
       };
-    });
+    }));
 
     // Create subscription - use actual custom plan name as packageType
     const actualPackageType = packageType === 'Custom' ? customPlanName : packageType;
@@ -1543,7 +1610,8 @@ router.post('/:id/monthly-subscription', async (req, res) => {
         date: wash.scheduledDate,
         feedback: '',
         is_amountPaid: Boolean(paymentStatus),
-        washStatus: 'pending'
+        washStatus: 'pending',
+        washServiceType: wash.washServiceType
       });
     });
 
