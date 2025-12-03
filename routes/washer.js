@@ -510,6 +510,9 @@ router.get('/:washerId/debug-washes', async (req, res) => {
 router.get('/:washerId/assigned-leads', async (req, res) => {
   try {
     const { washerId } = req.params;
+    const { startDate, endDate } = req.query;
+    
+    console.log('Assigned leads API called with:', { washerId, startDate, endDate });
     
     let washer;
     if (!isNaN(washerId)) {
@@ -522,32 +525,76 @@ router.get('/:washerId/assigned-leads', async (req, res) => {
       return res.status(404).json({ message: 'Washer not found' });
     }
 
-    // Find all leads with wash history assigned to this washer
-    const assignedLeads = await Lead.find({
-      $or: [
-        { assignedWasher: washer._id },
-        { 'washHistory.washer': washer._id },
-        { 'monthlySubscription.scheduledWashes.washer': washer._id },
-        { 'oneTimeWash.washer': washer._id }
-      ]
-    })
+    // Parse date filters
+    let startDateObj = null;
+    let endDateObj = null;
+    if (startDate) {
+      startDateObj = new Date(startDate);
+      startDateObj.setHours(0, 0, 0, 0);
+    }
+    if (endDate) {
+      endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+    }
+
+    // Build query to find leads with wash history for this washer
+    // Only check washHistory.washer, not assignedWasher
+    const query = {
+      'washHistory.washer': washer._id
+    };
+
+    // Add date filter to query if provided
+    if (startDateObj && endDateObj) {
+      query['washHistory'] = {
+        $elemMatch: {
+          washer: washer._id,
+          date: { $gte: startDateObj, $lte: endDateObj }
+        }
+      };
+    }
+
+    const assignedLeads = await Lead.find(query)
     .populate('assignedWasher', 'name')
     .populate('washHistory.washer', 'name')
-    .populate('oneTimeWash.washer', 'name')
     .sort({ createdAt: -1 });
 
-    const oneTimeLeads = assignedLeads.filter(lead => lead.leadType === 'One-time');
-    const monthlyLeads = assignedLeads.filter(lead => lead.leadType === 'Monthly');
+    // Filter washHistory array to only show washes in the date range for this washer
+    let filteredLeads = assignedLeads.map(lead => {
+      const leadObj = lead.toObject();
+      
+      if (startDateObj && endDateObj && leadObj.washHistory && leadObj.washHistory.length > 0) {
+        // Filter washHistory to only include washes by this washer within date range
+        leadObj.washHistory = leadObj.washHistory.filter(wash => {
+          if (wash.washer && wash.washer._id.toString() === washer._id.toString() && wash.date) {
+            const washDate = new Date(wash.date);
+            return washDate >= startDateObj && washDate <= endDateObj;
+          }
+          return false;
+        });
+      } else if (leadObj.washHistory && leadObj.washHistory.length > 0) {
+        // If no date filter, only show washes by this washer
+        leadObj.washHistory = leadObj.washHistory.filter(wash => {
+          return wash.washer && wash.washer._id.toString() === washer._id.toString();
+        });
+      }
+      
+      return leadObj;
+    });
+
+    const oneTimeLeads = filteredLeads.filter(lead => lead.leadType === 'One-time');
+    const monthlyLeads = filteredLeads.filter(lead => lead.leadType === 'Monthly');
+
+    console.log('Filtered leads count:', filteredLeads.length);
 
     res.json({
-      allLeads: assignedLeads,
+      allLeads: filteredLeads,
       oneTimeLeads,
       monthlyLeads,
       summary: {
-        total: assignedLeads.length,
+        total: filteredLeads.length,
         oneTime: oneTimeLeads.length,
         monthly: monthlyLeads.length,
-        converted: assignedLeads.filter(lead => lead.status === 'Converted').length
+        converted: filteredLeads.filter(lead => lead.status === 'Converted').length
       }
     });
   } catch (error) {
@@ -759,15 +806,30 @@ router.post('/:id/status', async (req, res) => {
 //get by id
 router.get('/:id/wash-details', async (req, res) => {
   try {
+    const { startDate, endDate } = req.query;
     const washer = await User.findOne({id: parseInt(req.params.id)});
 
     if (!washer) {
       return res.status(404).json({ message: 'Washer not found' });
     }
 
-    // Get all leads assigned to this washer with their wash history
+    console.log('Wash details API called with:', { washerId: req.params.id, startDate, endDate });
+
+    // Parse date filters
+    let startDateObj = null;
+    let endDateObj = null;
+    if (startDate) {
+      startDateObj = new Date(startDate);
+      startDateObj.setHours(0, 0, 0, 0);
+    }
+    if (endDate) {
+      endDateObj = new Date(endDate);
+      endDateObj.setHours(23, 59, 59, 999);
+    }
+
+    // Get all leads with wash history for this washer
+    // Only check washHistory.washer, not assignedWasher
     const leads = await Lead.find({
-      assignedWasher: washer._id,
       'washHistory.washer': washer._id
     }).sort({ createdAt: -1 });
 
@@ -782,33 +844,42 @@ router.get('/:id/wash-details', async (req, res) => {
       if (lead.washHistory && lead.washHistory.length > 0) {
         lead.washHistory.forEach(wash => {
           if (wash.washer && wash.washer.toString() === washer._id.toString()) {
-            totalWashes++;
-            if (wash.washStatus === 'completed') {
-              totalCompletedWashes++;
-              // Only count earnings from completed AND paid washes
-              if (wash.is_amountPaid === true) {
-                totalEarnings += wash.amount || 0;
-              }
+            // Apply date filter on wash.date
+            let dateMatch = true;
+            if (startDateObj && endDateObj && wash.date) {
+              const washDate = new Date(wash.date);
+              dateMatch = washDate >= startDateObj && washDate <= endDateObj;
             }
 
-            // Add to all washes array
-            allWashes.push({
-              id: wash._id,
-              customerName: lead.customerName,
-              customerPhone: lead.phone,
-              area: lead.area,
-              carModel: lead.carModel,
-              washType: wash.washType,
-              amount: wash.amount,
-              date: wash.date,
-              status: wash.washStatus,
-              feedback: wash.feedback,
-              isPaid: wash.is_amountPaid,
-              leadType: lead.leadType,
-              leadSource: lead.leadSource,
-              createdAt: wash.createdAt,
-              updatedAt: wash.updatedAt
-            });
+            if (dateMatch) {
+              totalWashes++;
+              if (wash.washStatus === 'completed') {
+                totalCompletedWashes++;
+                // Only count earnings from completed AND paid washes
+                if (wash.is_amountPaid === true) {
+                  totalEarnings += wash.amount || 0;
+                }
+              }
+
+              // Add to all washes array
+              allWashes.push({
+                id: wash._id,
+                customerName: lead.customerName,
+                customerPhone: lead.phone,
+                area: lead.area,
+                carModel: lead.carModel,
+                washType: wash.washType,
+                amount: wash.amount,
+                date: wash.date,
+                status: wash.washStatus,
+                feedback: wash.feedback,
+                isPaid: wash.is_amountPaid,
+                leadType: lead.leadType,
+                leadSource: lead.leadSource,
+                createdAt: wash.createdAt,
+                updatedAt: wash.updatedAt
+              });
+            }
           }
         });
       }
@@ -819,6 +890,8 @@ router.get('/:id/wash-details', async (req, res) => {
 
     // Get recent washes (last 10)
     const recentWashes = allWashes.slice(0, 10);
+
+    console.log('Filtered washes count:', allWashes.length);
 
     res.json({
       ...washer.toObject(),
